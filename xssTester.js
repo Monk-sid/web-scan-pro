@@ -1,54 +1,159 @@
-(async function xssTester() {
-  // Sample payload to inject
-  const payload = "<script>alert('XSS')</script>";
+const xssPayloads = [
+  '<script>alert(1)</script>',
+  '<img src=x onerror=alert(1)>',
+  '<svg onload=alert(1)>'
+];
 
-  // Parameters to test - you can expand this as needed
-  const testParams = ['input1', 'comment', 'search', 'msg'];
+const reflectPatterns = xssPayloads.map(p =>
+  new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+);
 
-  // Base URL for testing (change this to your target)
-  const baseUrl = window.location.origin + window.location.pathname;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  const vulnerableEndpoints = [];
+function getParams(url) {
+  const params = {};
+  const urlObj = new URL(url);
+  for (const [key, value] of urlObj.searchParams.entries()) {
+    params[key] = value;
+  }
+  return params;
+}
 
-  for (const param of testParams) {
-    try {
-      // Construct URL with payload injected in param
-      const testUrl = `${baseUrl}?${param}=${encodeURIComponent(payload)}`;
+async function isPayloadReflected(body, patterns) {
+  return patterns.some(pattern => pattern.test(body));
+}
 
-      // Fetch page with injected param
-      const response = await fetch(testUrl);
-      const text = await response.text();
+async function testUrlParams(url) {
+  const params = getParams(url);
+  const findings = [];
 
-      // Simple response analysis: check if payload is present in returned HTML (reflected)
-      if (text.includes(payload)) {
-        vulnerableEndpoints.push(testUrl);
-        console.log(`Possible reflected XSS detected at: ${testUrl}`);
+  if (Object.keys(params).length === 0) {
+    console.log("No query parameters to test.");
+    return findings;
+  }
+
+  for (const param in params) {
+    for (const payload of xssPayloads) {
+      const urlObj = new URL(url);
+      urlObj.searchParams.set(param, payload);
+
+      console.log(`Testing param "${param}" with payload "${payload}"`);
+
+      try {
+        const response = await fetch(urlObj.toString());
+        const body = await response.text();
+
+        if (await isPayloadReflected(body, reflectPatterns)) {
+          findings.push({
+            endpoint: urlObj.toString(),
+            param,
+            payload,
+            evidence: 'Payload reflected in response'
+          });
+        }
+        await sleep(100);
+      } catch (e) {
+        console.error(`Request failed: ${e.message} for URL: ${urlObj.toString()}`);
       }
-
-      // Create a DOM parser to detect payload in DOM (simulate DOM inspection)
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(text, 'text/html');
-      if (doc.body.innerHTML.includes(payload)) {
-        vulnerableEndpoints.push(testUrl);
-        console.log(`Payload found in DOM for: ${testUrl}`);
-      }
-
-    } catch (error) {
-      console.error("Error testing param", param, error);
     }
   }
+  return findings;
+}
 
-  if (vulnerableEndpoints.length) {
-    console.log("Summary of vulnerable URLs detected:");
-    vulnerableEndpoints.forEach(url => console.log(url));
-  } else {
-    console.log("No reflections of payload found - no reflected XSS detected in tested parameters.");
+async function getForms(url) {
+  // Get HTML content and parse forms (simplified)
+  // For complex parsing, using DOMParser in browser or parsing library in Node is recommended
+  const response = await fetch(url);
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  return Array.from(doc.forms);
+}
+
+async function testForms(url) {
+  const findings = [];
+  try {
+    const forms = await getForms(url);
+
+    for (const form of forms) {
+      const action = form.action || url;
+      const method = (form.method || 'GET').toUpperCase();
+
+      // Build default form data
+      const formData = {};
+      for (const element of form.elements) {
+        if (element.name) {
+          formData[element.name] = element.value || 'test';
+        }
+      }
+
+      for (const inputName in formData) {
+        for (const payload of xssPayloads) {
+          const testData = { ...formData };
+          testData[inputName] = payload;
+
+          console.log(`Testing form action "${action}" method "${method}" input "${inputName}" with payload "${payload}"`);
+
+          try {
+            let response;
+            if (method === 'POST') {
+              response = await fetch(action, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams(testData).toString()
+              });
+            } else {
+              // GET with params in URL
+              const getUrl = new URL(action);
+              Object.entries(testData).forEach(([k, v]) => getUrl.searchParams.set(k, v));
+              response = await fetch(getUrl.toString());
+            }
+
+            const body = await response.text();
+
+            if (await isPayloadReflected(body, reflectPatterns)) {
+              findings.push({
+                endpoint: action,
+                param: inputName,
+                payload,
+                evidence: 'Payload reflected in response'
+              });
+            }
+
+            await sleep(100);
+          } catch (e) {
+            console.error(`Form request failed: ${e.message} for action: ${action}`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`Failed to get forms from ${url}: ${e.message}`);
+  }
+  return findings;
+}
+
+async function runScan(urls) {
+  let allFindings = [];
+
+  for (const url of urls) {
+    console.log(`Scanning URL parameters on: ${url}`);
+    const paramFindings = await testUrlParams(url);
+    allFindings = allFindings.concat(paramFindings);
+
+    console.log(`Scanning forms on: ${url}`);
+    const formFindings = await testForms(url);
+    allFindings = allFindings.concat(formFindings);
   }
 
-  console.log("\n--- XSS Prevention Tips ---");
-  console.log("* Sanitize and encode all user inputs on server and client side.");
-  console.log("* Use Content Security Policy (CSP) headers.");
-  console.log("* Avoid directly injecting untrusted data into HTML without escaping.");
-  console.log("* Use frameworks and libraries that auto-escape outputs.");
+  return allFindings;
+}
 
-})();
+// Example usage:
+const targetUrls = ['http://localhost:8080/'];
+
+runScan(targetUrls).then(findings => {
+  console.log('Scan completed. Findings:', findings);
+});
