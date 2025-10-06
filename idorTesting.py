@@ -1,75 +1,144 @@
 import requests
+import re
 import time
+from urllib.parse import urljoin
 
-# Use DVWA default credentials
+# Base URL for the DVWA instance
+BASE_URL = "http://localhost:8080/"
+
+# Define the users to test, including their IDs and first names for verification
 USERS = [
-    {"username": "admin", "password": "password", "role": "admin"},
-    {"username": "user", "password": "password", "role": "standard"},
+    {'id': '1', 'username': 'admin', 'password': 'password', 'role': 'admin', 'name': 'admin'},
+    {'id': '2', 'username': 'gordonb', 'password': 'password', 'role': 'user', 'name': 'Gordon'},
+    {'id': '3', 'username': 'pablo', 'password': 'password', 'role': 'user', 'name': 'Pablo'},
 ]
 
-# Correct DVWA endpoints
-LOGIN_URL = "http://localhost:8080/login.php"  # DVWA login form endpoint
-PROFILE_URL = "http://localhost:8080/vulnerabilities/idor/"  # IDOR page for horizontal tests
-IDOR_TEST_URL = "http://localhost:8080/vulnerabilities/idor/"  # IDOR vulnerable URL
+class IDORScanner:
+    def __init__(self):
+        self.findings = []
 
-def login(session, username, password):
-    login_data = {
-        "username": username,
-        "password": password
-    }
-    res = session.post(LOGIN_URL, data=login_data)  # use form-encoded data with 'data='
-    # Consider testing for successful login here by checking res.text or cookies if needed
-    return res.status_code == 200
+    def _get_csrf_token(self, session, url):
+        """Helper function to fetch a CSRF token from a given page."""
+        try:
+            response = session.get(url)
+            response.raise_for_status()
+            pattern = r"name=['\"]user_token['\"]\s*value=['\"](.*?)['\"]"
+            match = re.search(pattern, response.text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+            return None
+        except requests.RequestException:
+            return None
 
-def test_horizontal_escalation(session, user_id, target_user_id):
-    # Simulate accessing another user's resource
-    url = f"{PROFILE_URL}?id={target_user_id}"  # DVWA IDOR expects 'id' param in query string
-    res = session.get(url)
-    if res.status_code == 200 and target_user_id != user_id:
-        print(f"Horizontal Privilege Escalation: User {user_id} accessed {target_user_id}'s data")
-    else:
-        print(f"Access denied or same user data requested.")
-
-def test_vertical_escalation(session):
-    # Attempt access to admin-only page, adjust URL to DVWA admin resource if exists 
-    admin_url = "http://localhost:8080/admin.php"  # Example; replace with actual admin resource URL if any
-    res = session.get(admin_url)
-    if res.status_code == 200:
-        print("Vertical Privilege Escalation: Accessed admin resource!")
-    else:
-        print("Access to admin resource denied.")
-
-def test_idor(session, valid_id, test_id):
-    # Access object by ID and test unauthorized access by modifying ID param
-    url_valid = f"{IDOR_TEST_URL}?id={valid_id}"
-    url_test = f"{IDOR_TEST_URL}?id={test_id}"
-
-    res_valid = session.get(url_valid)
-    res_test = session.get(url_test)
-
-    if res_test.status_code == 200 and valid_id != test_id:
-        print(f"IDOR Detected: Accessed object {test_id} unauthorized!")
-    else:
-        print("No IDOR detected or access denied.")
-
-def main():
-    findings = []
-    for user_info in USERS:
+    def setup_session(self, username, password):
+        """
+        Handles the entire setup process for a user: login and set security level.
+        Returns a fully configured session object if successful, otherwise None.
+        """
         session = requests.Session()
-        if login(session, user_info["username"], user_info["password"]):
-            print(f"Logged in as {user_info['username']} (Role: {user_info['role']})")
+        login_url = urljoin(BASE_URL, 'login.php')
+        security_url = urljoin(BASE_URL, 'security.php')
 
-            # Here user_id and target_user_id simulate user identifiers; DVWA does not expose user IDs, so use numeric IDs or strings as needed
-            current_user_id = "1"  # example: current user id 1
-            other_user_id = "2"    # example: another user id 2
+        # --- Step 1: Login ---
+        login_token = self._get_csrf_token(session, login_url)
+        if not login_token:
+            print(f"  [FAIL] Login failed for {username}: Could not get login CSRF token.")
+            return None
 
-            test_horizontal_escalation(session, current_user_id, other_user_id)
-            test_vertical_escalation(session)
-            test_idor(session, valid_id="1", test_id="2")
-        else:
-            print(f"Login failed for {user_info['username']}")
+        login_data = {
+            'username': username,
+            'password': password,
+            'user_token': login_token,
+            'Login': 'Login'
+        }
+        
+        try:
+            response = session.post(login_url, data=login_data, allow_redirects=True)
+            if "index.php" not in response.url:
+                print(f"  [FAIL] Login failed for {username}: Check credentials.")
+                return None
+            print(f"  [SUCCESS] Logged in as {username}")
+        except requests.RequestException as e:
+            print(f"  [FAIL] Login request failed for {username}: {e}")
+            return None
 
-        time.sleep(0.3)  # Throttle between user tests
+        # --- Step 2: Set Security Level ---
+        security_token = self._get_csrf_token(session, security_url)
+        if not security_token:
+            print(f"  [FAIL] Failed to set security for {username}: Could not get security CSRF token.")
+            return None
+            
+        security_data = {
+            'security': 'low',
+            'seclev_submit': 'Submit',
+            'user_token': security_token
+        }
+        
+        headers = {'Referer': security_url}
+        
+        try:
+            response = session.post(security_url, data=security_data, headers=headers)
+            if "Security level is currently: low" in response.text:
+                print("  [SUCCESS] Security level set to low.")
+                return session # Return the fully configured session
+            else:
+                debug_file = f"security_fail_debug_{username}.html"
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(response.text)
+                print(f"  [FAIL] Failed to set security level. See {debug_file} for details.")
+                return None
+        except requests.RequestException as e:
+            print(f"  [FAIL] Request to set security level failed: {e}")
+            return None
 
-if __name__ == "__main__":
-    main()
+    def test_horizontal_escalation(self, session, current_user, target_user):
+        """Tests if the current user can access the target user's data."""
+        idor_url = urljoin(BASE_URL, f"vulnerabilities/idor/?id={target_user['id']}")
+        try:
+            response = session.get(idor_url)
+            expected_text = f"First name: {target_user['name']}"
+            if response.status_code == 200 and expected_text in response.text:
+                print(f"  [VULNERABLE] User '{current_user['username']}' accessed User '{target_user['username']}'s data.")
+                finding = {
+                    "type": "IDOR", "endpoint": idor_url, "severity": "High",
+                    "mitigation": "Ensure server-side authorization checks prevent users from accessing unauthorized resources.",
+                    "param": "id", "payload": target_user['id'],
+                    "evidence": f"Successfully viewed profile of {target_user['username']}",
+                    "username": current_user['username']
+                }
+                if finding not in self.findings:
+                    self.findings.append(finding)
+            else:
+                print(f"  [SECURE] Access to User '{target_user['username']}'s data properly denied.")
+        except requests.RequestException as e:
+            print(f"  [ERROR] IDOR test request failed: {e}")
+
+    def logout(self, session):
+        """Logs out the current session."""
+        try:
+            session.get(urljoin(BASE_URL, 'logout.php'))
+            print("  [INFO] Logged out.")
+        except requests.RequestException:
+            pass
+
+    def run(self, pages):
+        print("\n[*] Running IDOR scanner...")
+        for current_user in USERS:
+            print(f"\n[TESTING AS] User: {current_user['username']} (Role: {current_user['role']})")
+            
+            session = self.setup_session(current_user['username'], current_user['password'])
+            
+            if session:
+                # Test access to all OTHER users' data
+                for target_user in USERS:
+                    if current_user['id'] != target_user['id']:
+                        print(f"  - Testing: Can {current_user['username']} access {target_user['username']}'s data?")
+                        self.test_horizontal_escalation(session, current_user, target_user)
+                
+                self.logout(session)
+            
+            time.sleep(0.5)
+
+        print(f"\n[*] IDOR scanner finished. Found {len(self.findings)} issues.")
+        return self.findings
+

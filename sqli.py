@@ -1,10 +1,39 @@
 import time
 import copy
+import re
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-from utils import get_session, find_sql_errors
-import requests
-from bs4 import BeautifulSoup
-from crawler import Crawler 
+
+from .scanner_utils import get_session
+
+def find_sql_errors(html_text):
+    """
+    Looks for common SQL error messages in a string.
+    Returns (True, pattern) if an error is found, else (False, None).
+    """
+    if not html_text:
+        return (False, None)
+        
+    # Common SQL error patterns, made more robust
+    sql_errors = [
+        r"you have an error in your sql syntax",
+        r"warning: mysql_fetch_array\(\)",
+        r"unclosed quotation mark after the character string",
+        r"quoted string not properly terminated",
+        r"sql command not properly ended",
+        r"microsoft ole db provider for odbc drivers error",
+        r"invalid querystring",
+        r"odbc driver error",
+        r"jet database engine error",
+        r"microsoft jet database engine error",
+        r"error connecting to database",
+        r"supplied argument is not a valid mysql result resource",
+        r"syntax error",
+    ]
+    
+    for error in sql_errors:
+        if re.search(error, html_text, re.IGNORECASE):
+            return (True, error)
+    return (False, None)
 
 
 class SQLiScanner:
@@ -14,44 +43,14 @@ class SQLiScanner:
         self.timeout = timeout
         self.findings = []
 
-        # Common SQL Injection payloads (safe for labs, don’t use on real targets)
+        # Common SQL Injection payloads
         self.payloads = [
             "' OR '1'='1",
             "' OR 1=1--",
             "\" OR \"1\"=\"1",
-            "'; DROP TABLE users; --"  # 
+            "admin'--",
+            "' OR 'x'='x",
         ]
-
-    
-    def crawl(self):
-
-        urls = [self.target]
-        forms_by_url = {}
-
-        try:
-            response = requests.get(self.target)
-            soup = BeautifulSoup(response.text, "html.parser")
-            forms = soup.find_all("form")
-            form_list = []
-            for form in forms:
-                inputs = {}
-                for inp in form.find_all("input"):
-                    name = inp.get("name")
-                    value = inp.get("value")
-                    if name:
-                        inputs[name] = value
-                form_data = {
-                      "action": form.get("action"),
-                    "method": form.get("method", "get"),
-                    "inputs": inputs
-                }
-                form_list.append(form_data)
-            forms_by_url[self.target] = form_list
-        except Exception as e:
-            print(f"[!] Crawling failed: {e}")
-
-        return urls, forms_by_url
-    
 
     def test_url_params(self, url):
         """Test query parameters for SQL injection."""
@@ -74,13 +73,17 @@ class SQLiScanner:
                     vulnerable, pattern = find_sql_errors(r.text)
 
                     if vulnerable:
-                        self.findings.append({
-                            "type": "url_param",
-                            "url": test_url,
+                        finding = {
+                            "type": "SQLi",
+                            "endpoint": test_url,
+                            "severity": "High",
+                            "mitigation": "Use parameterized queries or prepared statements.",
                             "param": param,
                             "payload": payload,
-                            "pattern": pattern
-                        })
+                            "evidence": f"Detected pattern: {pattern}"
+                        }
+                        if finding not in self.findings:
+                            self.findings.append(finding)
                 except Exception as e:
                     print(f"[!] Request failed for {test_url}: {e}")
 
@@ -92,15 +95,25 @@ class SQLiScanner:
             for form in form_list:
                 action = form.get("action") or page_url
                 method = form.get("method", "get").lower()
-                inputs = form.get("inputs", {})
+                inputs = form.get("inputs", [])
 
-                # baseline form data
-                form_data = {name: (val if val else "test") for name, val in inputs.items()}
+                # Convert list of inputs to a dictionary for baseline data
+                form_data = {}
+                for input_field in inputs:
+                    name = input_field.get('name')
+                    value = input_field.get('value', 'test')
+                    if name:
+                        form_data[name] = value
 
-                for field in inputs:
+                # Iterate through each input field to inject payload
+                for input_to_test in inputs:
+                    field_name = input_to_test.get('name')
+                    if not field_name:
+                        continue # Skip inputs without a name
+
                     for payload in self.payloads:
                         test_data = form_data.copy()
-                        test_data[field] = payload
+                        test_data[field_name] = payload
 
                         try:
                             if method == "post":
@@ -111,13 +124,17 @@ class SQLiScanner:
                             vulnerable, pattern = find_sql_errors(r.text)
 
                             if vulnerable:
-                                self.findings.append({
-                                    "type": "form",
-                                    "url": action,
-                                    "field": field,
+                                finding = {
+                                    "type": "SQLi",
+                                    "endpoint": action,
+                                    "severity": "High",
+                                    "mitigation": "Use parameterized queries and validate user input.",
+                                    "param": field_name,
                                     "payload": payload,
-                                    "pattern": pattern
-                                })
+                                    "evidence": f"Detected pattern: {pattern}"
+                                }
+                                if finding not in self.findings:
+                                    self.findings.append(finding)
                         except Exception as e:
                             print(f"[!] Form request failed: {e}")
 
@@ -130,18 +147,3 @@ class SQLiScanner:
 
         self.test_forms(form_dict)
         return self.findings
-
-
-if __name__ == "__main__":
-    target = "http://localhost:8080/"
-    crawler = Crawler(target, max_pages=50)
-    crawler.crawl()  # crawls and populates crawler.visited and crawler.forms
-
-    urls = list(crawler.visited)         # get all discovered page URLs
-    forms_by_url = crawler.forms         # get all discovered forms by URL
-
-    scanner = SQLiScanner(target)
-    results = scanner.run(urls, forms_by_url)
-
-    for finding in results:
-        print(f"[+] Found {finding['type']} vulnerability:", finding)
